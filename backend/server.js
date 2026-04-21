@@ -7,7 +7,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT;
 
 let bot = null;
 
