@@ -1,30 +1,32 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import { viteStaticCopy } from 'vite-plugin-static-copy';
+import { resolve } from 'path';
+import { copyFileSync, mkdirSync } from 'fs';
+
+function copyPdfWorker() {
+  return {
+    name: 'copy-pdf-worker',
+    closeBundle() {
+      try {
+        mkdirSync('dist', { recursive: true });
+        copyFileSync(
+          resolve('node_modules/pdfjs-dist/build/pdf.worker.min.mjs'),
+          resolve('dist/pdf.worker.min.mjs')
+        );
+      } catch (e) {
+        console.warn('Could not copy pdf worker:', e.message);
+      }
+    },
+  };
+}
 
 export default defineConfig({
-  plugins: [
-    react(),
-    viteStaticCopy({
-      targets: [
-        {
-          src: 'node_modules/pdfjs-dist/build/pdf.worker.min.mjs',
-          dest: '',
-          rename: 'pdf.worker.min.mjs',
-        },
-      ],
-    }),
-  ],
+  plugins: [react(), copyPdfWorker()],
   server: {
     port: 5173,
     proxy: {
-      '/api': {
-        target: 'http://localhost:3001',
-        changeOrigin: true,
-      }
+      '/api': { target: 'http://localhost:3001', changeOrigin: true }
     }
   },
-  optimizeDeps: {
-    include: ['pdfjs-dist']
-  }
+  optimizeDeps: { include: ['pdfjs-dist'] }
 });
