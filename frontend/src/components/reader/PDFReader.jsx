@@ -18,12 +18,7 @@ let pdfjsLib = null;
 async function getPdfJs() {
   if (pdfjsLib) return pdfjsLib;
   pdfjsLib = await import('pdfjs-dist');
-  // Use the locally bundled worker (copied to /public by vite-plugin-static-copy)
-  // This avoids CDN version mismatches and external fetch failures on Vercel
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-    '/pdf.worker.min.mjs',
-    import.meta.url
-  ).href;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('/pdf.worker.min.mjs', import.meta.url).href;
   return pdfjsLib;
 }
 
