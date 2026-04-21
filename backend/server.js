@@ -9,14 +9,14 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
+const https = require('https');
+const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 // ─── Telegram Bot Setup ───────────────────────────────────────────────────────
 let bot = null;
-let botInfo = null;
 
 function initBot() {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -43,7 +43,6 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Rate limiting
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200 });
 app.use(limiter);
 
@@ -62,52 +61,24 @@ function requireAuth(req, res, next) {
   }
 }
 
-// ─── Demo Data (when Telegram not configured) ─────────────────────────────────
+// ─── Demo Data ────────────────────────────────────────────────────────────────
 const DEMO_FILES = [
-  {
-    id: 'demo_1', message_id: 1001, file_id: 'demo_file_1',
-    name: 'The Art of War - Sun Tzu.pdf', size: 2457600,
-    date: Date.now() / 1000 - 86400 * 7, mime_type: 'application/pdf',
-    caption: 'Classic military strategy text'
-  },
-  {
-    id: 'demo_2', message_id: 1002, file_id: 'demo_file_2',
-    name: 'Atomic Habits - James Clear.pdf', size: 8912896,
-    date: Date.now() / 1000 - 86400 * 3, mime_type: 'application/pdf',
-    caption: 'Build good habits, break bad ones'
-  },
-  {
-    id: 'demo_3', message_id: 1003, file_id: 'demo_file_3',
-    name: 'Deep Work - Cal Newport.pdf', size: 5242880,
-    date: Date.now() / 1000 - 86400 * 1, mime_type: 'application/pdf',
-    caption: 'Rules for focused success in a distracted world'
-  },
-  {
-    id: 'demo_4', message_id: 1004, file_id: 'demo_file_4',
-    name: 'Thinking Fast and Slow - Kahneman.pdf', size: 12582912,
-    date: Date.now() / 1000 - 86400 * 14, mime_type: 'application/pdf',
-    caption: 'Dual process theory of thinking'
-  },
-  {
-    id: 'demo_5', message_id: 1005, file_id: 'demo_file_5',
-    name: 'Zero to One - Peter Thiel.pdf', size: 4194304,
-    date: Date.now() / 1000 - 86400 * 21, mime_type: 'application/pdf',
-    caption: 'Notes on startups, or how to build the future'
-  },
-  {
-    id: 'demo_6', message_id: 1006, file_id: 'demo_file_6',
-    name: 'The Pragmatic Programmer.pdf', size: 9437184,
-    date: Date.now() / 1000 - 86400 * 5, mime_type: 'application/pdf',
-    caption: 'Your journey to mastery'
-  },
+  { id: 'demo_1', message_id: 1001, file_id: 'demo_file_1', name: 'The Art of War - Sun Tzu.pdf', size: 2457600, date: Date.now() / 1000 - 86400 * 7, mime_type: 'application/pdf', caption: 'Classic military strategy text' },
+  { id: 'demo_2', message_id: 1002, file_id: 'demo_file_2', name: 'Atomic Habits - James Clear.pdf', size: 8912896, date: Date.now() / 1000 - 86400 * 3, mime_type: 'application/pdf', caption: 'Build good habits, break bad ones' },
+  { id: 'demo_3', message_id: 1003, file_id: 'demo_file_3', name: 'Deep Work - Cal Newport.pdf', size: 5242880, date: Date.now() / 1000 - 86400 * 1, mime_type: 'application/pdf', caption: 'Rules for focused success' },
+  { id: 'demo_4', message_id: 1004, file_id: 'demo_file_4', name: 'Thinking Fast and Slow.pdf', size: 12582912, date: Date.now() / 1000 - 86400 * 14, mime_type: 'application/pdf', caption: 'Dual process theory' },
+  { id: 'demo_5', message_id: 1005, file_id: 'demo_file_5', name: 'Zero to One - Peter Thiel.pdf', size: 4194304, date: Date.now() / 1000 - 86400 * 21, mime_type: 'application/pdf', caption: 'How to build the future' },
+  { id: 'demo_6', message_id: 1006, file_id: 'demo_file_6', name: 'The Pragmatic Programmer.pdf', size: 9437184, date: Date.now() / 1000 - 86400 * 5, mime_type: 'application/pdf', caption: 'Your journey to mastery' },
 ];
 
+// In-memory cache: maps "msg_<message_id>" -> actual Telegram file_id string
+const fileIdCache = new Map();
+
 // ─── Telegram Helpers ─────────────────────────────────────────────────────────
-async function fetchChannelMessages(channelId, limit = 100) {
+async function fetchChannelMessages(channelId) {
   if (!bot) return DEMO_FILES;
 
   try {
-    // Use Bot API to get recent messages with documents
     const updates = await bot.getUpdates({ limit: 100, allowed_updates: ['channel_post'] });
     const files = [];
 
@@ -115,12 +86,15 @@ async function fetchChannelMessages(channelId, limit = 100) {
       const msg = update.channel_post;
       if (!msg || msg.chat.id.toString() !== channelId.toString()) continue;
       if (!msg.document) continue;
-
       const doc = msg.document;
       if (doc.mime_type !== 'application/pdf') continue;
 
+      const id = `msg_${msg.message_id}`;
+      // Cache the real Telegram file_id so the stream route can find it
+      fileIdCache.set(id, doc.file_id);
+
       files.push({
-        id: `msg_${msg.message_id}`,
+        id,
         message_id: msg.message_id,
         file_id: doc.file_id,
         name: doc.file_name || `Document_${msg.message_id}.pdf`,
@@ -138,61 +112,77 @@ async function fetchChannelMessages(channelId, limit = 100) {
   }
 }
 
-async function getFileDownloadUrl(fileId) {
-  if (!bot || fileId.startsWith('demo_')) {
-    // Return a sample PDF for demo mode
+// Resolves a route fileId (e.g. "msg_507") to an actual Telegram file_id,
+// then returns the direct download URL.
+async function getFileDownloadUrl(routeFileId) {
+  // Demo mode or demo file
+  if (!bot || routeFileId.startsWith('demo_')) {
     return 'https://www.w3.org/WAI/WCAG21/Techniques/pdf/PDF1.pdf';
   }
 
-  try {
-    const file = await bot.getFile(fileId);
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    return `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-  } catch (e) {
-    console.error('Get file error:', e.message);
-    throw new Error('Failed to get file URL');
+  // Look up the real Telegram file_id from cache
+  let telegramFileId = fileIdCache.get(routeFileId);
+
+  // If not cached yet (e.g. server restarted), re-fetch the channel
+  if (!telegramFileId) {
+    const channelId = process.env.TELEGRAM_CHANNEL_ID;
+    if (channelId) await fetchChannelMessages(channelId);
+    telegramFileId = fileIdCache.get(routeFileId);
   }
+
+  if (!telegramFileId) {
+    throw new Error(`File not found: ${routeFileId}. Try refreshing the file list.`);
+  }
+
+  const file = await bot.getFile(telegramFileId);
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  return `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+}
+
+// Native Node streaming — no axios, no memory buffering, handles large files
+function streamUrl(url, headers, res) {
+  return new Promise((resolve, reject) => {
+    const proto = url.startsWith('https') ? https : http;
+    const req = proto.get(url, { headers }, (upstream) => {
+      res.status(upstream.statusCode);
+      // Forward relevant headers
+      ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(h => {
+        if (upstream.headers[h]) res.setHeader(h, upstream.headers[h]);
+      });
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      upstream.pipe(res);
+      upstream.on('end', resolve);
+      upstream.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(60000, () => { req.destroy(); reject(new Error('Request timed out')); });
+  });
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// Health check
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    telegram: bot ? 'connected' : 'demo_mode',
-    version: '1.0.0'
-  });
+  res.json({ status: 'ok', telegram: bot ? 'connected' : 'demo_mode', version: '1.0.0' });
 });
 
-// Login
 app.post('/api/auth/login', (req, res) => {
   const { password } = req.body;
   const correctPassword = process.env.APP_PASSWORD || 'Airflix@2003';
-
-  if (password !== correctPassword) {
-    return res.status(401).json({ error: 'Invalid password' });
-  }
+  if (password !== correctPassword) return res.status(401).json({ error: 'Invalid password' });
 
   const token = jwt.sign(
     { authenticated: true, loginAt: Date.now() },
     process.env.JWT_SECRET || 'dev_secret',
     { expiresIn: '7d' }
   );
-
-  res.json({
-    token,
-    message: 'Login successful',
-    demo_mode: !bot
-  });
+  res.json({ token, message: 'Login successful', demo_mode: !bot });
 });
 
-// Verify token
 app.get('/api/auth/verify', requireAuth, (req, res) => {
   res.json({ valid: true, demo_mode: !bot });
 });
 
-// List all PDFs from Telegram channel
 app.get('/api/files', requireAuth, async (req, res) => {
   try {
     const channelId = process.env.TELEGRAM_CHANNEL_ID || 'demo';
@@ -203,7 +193,6 @@ app.get('/api/files', requireAuth, async (req, res) => {
   }
 });
 
-// Get file info + download URL
 app.get('/api/files/:fileId/url', requireAuth, async (req, res) => {
   try {
     const url = await getFileDownloadUrl(req.params.fileId);
@@ -213,70 +202,41 @@ app.get('/api/files/:fileId/url', requireAuth, async (req, res) => {
   }
 });
 
-// Stream/proxy PDF (handles range requests for streaming)
+// Stream endpoint — proper range-request support for large PDFs
 app.get('/api/files/:fileId/stream', requireAuth, async (req, res) => {
   try {
     const url = await getFileDownloadUrl(req.params.fileId);
-    const range = req.headers.range;
-
     const headers = { 'User-Agent': 'AirNotes/1.0' };
-    if (range) headers['Range'] = range;
+    if (req.headers.range) headers['Range'] = req.headers.range;
 
-    const response = await axios({
-      method: 'GET',
-      url,
-      responseType: 'stream',
-      headers,
-      validateStatus: (s) => s < 500,
-    });
-
-    // Forward headers
-    res.status(response.status);
-    const contentType = response.headers['content-type'] || 'application/pdf';
-    const contentLength = response.headers['content-length'];
-    const contentRange = response.headers['content-range'];
-
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-    if (contentRange) res.setHeader('Content-Range', contentRange);
-
-    response.data.pipe(res);
+    await streamUrl(url, headers, res);
   } catch (e) {
     console.error('Stream error:', e.message);
-    res.status(500).json({ error: 'Failed to stream file' });
+    if (!res.headersSent) {
+      res.status(500).json({ error: e.message });
+    }
   }
 });
 
-// Search files
 app.get('/api/search', requireAuth, async (req, res) => {
   const { q } = req.query;
   if (!q) return res.json({ files: [] });
-
   try {
     const channelId = process.env.TELEGRAM_CHANNEL_ID || 'demo';
     const allFiles = await fetchChannelMessages(channelId);
     const query = q.toLowerCase();
-
     const results = allFiles.filter(f =>
       f.name.toLowerCase().includes(query) ||
       (f.caption && f.caption.toLowerCase().includes(query))
     );
-
     res.json({ files: results, query: q });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Bot info / connection test
 app.get('/api/telegram/info', requireAuth, async (req, res) => {
-  if (!bot) {
-    return res.json({ connected: false, mode: 'demo', message: 'Running in demo mode. Set TELEGRAM_BOT_TOKEN to connect.' });
-  }
-
+  if (!bot) return res.json({ connected: false, mode: 'demo' });
   try {
     const me = await bot.getMe();
     res.json({ connected: true, bot: me });
@@ -285,9 +245,9 @@ app.get('/api/telegram/info', requireAuth, async (req, res) => {
   }
 });
 
-// ─── Start Server ─────────────────────────────────────────────────────────────
+// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 AirNotes Backend running on http://localhost:${PORT}`);
-  console.log(`📡 Telegram: ${bot ? 'Connected' : 'Demo Mode (no token)'}`);
+  console.log(`📡 Telegram: ${bot ? 'Connected' : 'Demo Mode'}`);
   console.log(`📁 Channel: ${process.env.TELEGRAM_CHANNEL_ID || 'not set'}\n`);
 });
